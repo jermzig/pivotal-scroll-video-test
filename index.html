@@ -3,53 +3,328 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Scroll-Scrub Video (Google Drive)</title>
+  <title>Scroll & Swipe Scrubber with Momentum + Segment Autoplay</title>
   <style>
-#set-height {
-  display: block;
-}
-#v0 {
-  position: fixed;
-  top: 0;
-  left: 0;
-  width: 100%;
-}
-p font-family helvetica {
-  font-size: 24px;
-}
+    :root { --bg:#0b0e14; --fg:#e6e6e6; --muted:#a1a1a1; --accent:#7cc4ff; }
+    * { box-sizing: border-box; }
+    html, body { margin:0; padding:0; background:var(--bg); color:var(--fg); }
+    /* Tall spacer so we get a scrollable page that drives the scrub. */
+    #set-height { display:block; height: 200vh; }
+    /* Fixed video pinned to the viewport */
+    #v0 {
+      position: fixed; inset: 0 0 auto 0;
+      width: 100%; height: auto; max-height: 100dvh;
+      object-fit: contain; background: #000;
+    }
+    /* Tiny on-screen debug/time readout */
+    #hud {
+      position: fixed; right: 10px; bottom: 10px;
+      font: 12px/1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      background: rgba(0,0,0,.5); color:#fff; padding:8px 10px; border-radius:8px;
+      user-select:none; pointer-events:none;
+    }
   </style>
 </head>
 <body>
 
-<div id="set-height"></div>
-<p id="time"></p>
-<video id="v0" tabindex="0" autobuffer="autobuffer" preload="preload">
-  <source type="video/mp4; codecs=&quot;avc1.42E01E, mp4a.40.2&quot;" src="VIDEO/SAPC Video 1.mp4"></source>
-</video>
+  <div id="set-height"></div>
 
+  <!-- Your video source here. 'muted' allows programmatic autoplay without user gesture issues. -->
+  <video id="v0" muted preload="metadata" playsinline>
+    <source src="https://jermzig.github.io/pivotal-scroll-video-test/videos/SAPC%20Video%201.mp4" type="video/mp4" />
+  </video>
+
+  <div id="hud">t=0.00 • seg=— • dir=→ • v=0</div>
 
   <script>
-  var frameNumber = 0, // start video at frame 0
-    // lower numbers = faster playback
-    playbackConst = 500, 
-    // get page height from video duration
-    setHeight = document.getElementById("set-height"), 
-    // select video element         
-    vid = document.getElementById('v0'); 
+  // =========================
+  // SECTION 1: Configuration
+  // =========================
+  const video       = document.getElementById('v0');
+  const hud         = document.getElementById('hud');
+  const spacer      = document.getElementById('set-height');
 
-// dynamically set the page height according to video length
-vid.addEventListener('loadedmetadata', function() {
-  setHeight.style.height = Math.floor(vid.duration) * playbackConst + "px";
-});
+  // Scroll→time mapping: pixels per second of video.
+  // Larger = more scrolling needed per second of footage (finer control).
+  const PLAYBACK_CONST = 5000; 
 
-// Use requestAnimationFrame for smooth playback
-function scrollPlay(){  
-  var frameNumber  = window.pageYOffset/playbackConst;
-  vid.currentTime  = frameNumber;
-  window.requestAnimationFrame(scrollPlay);
-}
+  // Momentum tuning
+  const WHEEL_ACCEL      = 0.5;   // How strongly wheel deltas turn into velocity
+  const DRAG_MULTIPLIER  = 1.0;   // How strongly finger/mouse drag affects scroll
+  const FRICTION         = 0.95;  // 0.85–0.95 works well (higher = longer glide)
+  const MIN_VELOCITY_PX  = 0.12;  // stop threshold
 
-window.requestAnimationFrame(scrollPlay);
+  // Reverse "autoplay" speed (seconds per second) when we fake reverse playback
+  const REVERSE_SPEED_X  = 1.0;   // 1.0 ≈ normal speed in reverse (visual only)
+
+  // Click / tap detection thresholds
+  const TAP_MAX_MOVE_PX  = 10;
+  const TAP_MAX_MS       = 300;
+
+  // Segment anchors (in seconds). We'll finalize once metadata is known.
+  let anchors = [1.5, 3.8, 5.9]; // 'end' is appended when metadata loads
+
+  // State
+  let duration = 0;
+  let maxScroll = 0;
+
+  // Momentum state
+  let scrollVelocity = 0;       // pixels per frame
+  let inertiaRAF = null;
+  let lastRAF = null;
+
+  // Interaction state
+  let isDragging = false;
+  let dragLastY = 0;
+  let dragStartedAt = 0;
+  let dragStartClientY = 0;
+  let isAutoPlaying = false;    // blocks momentum while a segment autoplay runs
+  let direction = 1;            // 1 = forward, -1 = reverse baseline
+
+  // ==============================
+  // SECTION 2: Init once metadata
+  // ==============================
+  function setupAfterMetadata() {
+    duration = video.duration || 0;
+    // Complete anchors with 'end'
+    const end = duration || 9999;
+    anchors = [1.5, 3.8, 5.9].map(a => Math.min(a, end)); // clamp inside video
+    if (anchors[anchors.length - 1] < end) anchors.push(end);
+
+    // Make page tall enough to scrub entire timeline (plus a viewport of padding)
+    maxScroll = Math.max(0, Math.floor(end * PLAYBACK_CONST));
+    spacer.style.height = (maxScroll + window.innerHeight) + 'px';
+
+    // Start the sync loop that ties scrollY to currentTime
+    if (!lastRAF) lastRAF = requestAnimationFrame(syncVideoToScroll);
+  }
+
+  if (video.readyState >= 1) setupAfterMetadata();
+  else video.addEventListener('loadedmetadata', setupAfterMetadata);
+
+  // =======================================
+  // SECTION 3: Core scroll→time sync loop
+  // =======================================
+  function syncVideoToScroll() {
+    const targetTime = clamp(window.scrollY / PLAYBACK_CONST, 0, duration || 0);
+    if (!isAutoPlaying) {
+      // Only drive the video from scroll when not autoplaying a segment.
+      if (!Number.isNaN(targetTime)) {
+        video.currentTime = targetTime;
+      }
+    } else {
+      // Keep window scroll in sync with current video time during autoplay
+      const desiredY = (video.currentTime || 0) * PLAYBACK_CONST;
+      if (Math.abs(desiredY - window.scrollY) > 1) {
+        window.scrollTo(0, clamp(desiredY, 0, maxScroll));
+      }
+    }
+    renderHUD();
+    lastRAF = requestAnimationFrame(syncVideoToScroll);
+  }
+
+  function renderHUD() {
+    const t = (video.currentTime || 0).toFixed(2);
+    const segIndex = currentSegmentIndex(video.currentTime || 0);
+    const segTxt = segIndex === -1 ? '—' : segIndex + 1;
+    const dirTxt = direction > 0 ? '→' : '←';
+    hud.textContent = `t=${t} • seg=${segTxt} • dir=${dirTxt} • v=${scrollVelocity.toFixed(2)}`;
+  }
+
+  // ==========================================
+  // SECTION 4: Momentum (wheel + drag swipe)
+  // ==========================================
+  // Wheel momentum
+  window.addEventListener('wheel', (e) => {
+    if (isAutoPlaying) return; // ignore while segment autoplaying
+    e.preventDefault(); // we manage scroll ourselves for consistent momentum
+    scrollVelocity += e.deltaY * WHEEL_ACCEL;
+    startInertia();
+  }, { passive: false });
+
+  // Pointer-based drag momentum (mouse or touch)
+  window.addEventListener('pointerdown', (e) => {
+    if (isAutoPlaying) return; // tapping while autoplay cancels it via pointerup handler
+    isDragging = true;
+    dragLastY = e.clientY;
+    dragStartedAt = performance.now();
+    dragStartClientY = e.clientY;
+    stopInertia();
+  });
+
+  window.addEventListener('pointermove', (e) => {
+    if (!isDragging || isAutoPlaying) return;
+    const dy = dragLastY - e.clientY; // move up -> scroll down
+    dragLastY = e.clientY;
+    const nextY = clamp(window.scrollY + dy * DRAG_MULTIPLIER, 0, maxScroll);
+    scrollToY(nextY);
+    scrollVelocity = dy * DRAG_MULTIPLIER; // capture for inertia on release
+  });
+
+  window.addEventListener('pointerup', (e) => {
+    const moved = Math.abs(e.clientY - dragStartClientY);
+    const heldMs = performance.now() - dragStartedAt;
+    const wasTap = moved <= TAP_MAX_MOVE_PX && heldMs <= TAP_MAX_MS;
+    isDragging = false;
+
+    if (isAutoPlaying) {
+      // A user gesture during autoplay cancels it immediately.
+      cancelSegmentAutoplay();
+      return;
+    }
+
+    if (wasTap) {
+      // Treat quick taps as the "segment autoplay" trigger
+      handleTapForSegmentAutoplay();
+    } else {
+      // Start easing out with whatever velocity the drag ended on
+      startInertia();
+    }
+  });
+
+  function startInertia() {
+    if (inertiaRAF) return; // already gliding
+    const step = () => {
+      if (isAutoPlaying) { inertiaRAF = null; return; } // pause momentum during autoplay
+      if (Math.abs(scrollVelocity) < MIN_VELOCITY_PX) {
+        inertiaRAF = null; scrollVelocity = 0; return;
+      }
+      const nextY = clamp(window.scrollY + scrollVelocity, 0, maxScroll);
+      scrollToY(nextY);
+      scrollVelocity *= FRICTION;
+      inertiaRAF = requestAnimationFrame(step);
+    };
+    inertiaRAF = requestAnimationFrame(step);
+  }
+
+  function stopInertia() {
+    if (inertiaRAF) cancelAnimationFrame(inertiaRAF);
+    inertiaRAF = null;
+  }
+
+  function scrollToY(y) {
+    window.scrollTo(0, y);
+  }
+
+  // ==========================================
+  // SECTION 5: Segment autoplay on tap/click
+  // ==========================================
+  window.addEventListener('click', (e) => {
+    // Fallback: if it was a true click (not a drag), trigger autoplay.
+    // (Our pointerup handler already handles taps; this covers mouse clicks.)
+    if (!isDragging && !isAutoPlaying) handleTapForSegmentAutoplay();
+  });
+
+  function handleTapForSegmentAutoplay() {
+    if (!duration || duration === Infinity) return;
+
+    // If at (or within 100ms of) the very end, switch baseline direction to reverse.
+    if ((duration - (video.currentTime || 0)) <= 0.10) direction = -1;
+    if ((video.currentTime || 0) <= 0.10) direction = 1;
+
+    const t = video.currentTime || 0;
+    const target = (direction > 0) ? nextAnchorAbove(t) : prevAnchorBelow(t);
+
+    if (target == null) return; // no valid target
+    autoplayTo(target, direction);
+  }
+
+  function autoplayTo(targetTime, dir) {
+    cancelSegmentAutoplay(); // just in case
+    isAutoPlaying = true;
+    stopInertia();
+    scrollVelocity = 0;
+
+    // If forward, use native play; if reverse, simulate by stepping currentTime back.
+    if (dir > 0) {
+      // Forward
+      video.muted = true;           // be safe for autoplay policies
+      video.playbackRate = 1.0;
+      video.play().catch(() => {}); // ignore if browser blocks (we still step via RAF below)
+      const tick = () => {
+        if (!isAutoPlaying) return;
+        if ((video.currentTime || 0) >= targetTime - 0.01) {
+          video.pause();
+          video.currentTime = targetTime;
+          isAutoPlaying = false;
+          // If we hit the end, flip baseline direction to reverse for next tap
+          if (Math.abs(targetTime - duration) < 0.02) direction = -1;
+          return;
+        }
+        // keep scroll synced
+        const desiredY = (video.currentTime || 0) * PLAYBACK_CONST;
+        if (Math.abs(desiredY - window.scrollY) > 1) window.scrollTo(0, clamp(desiredY, 0, maxScroll));
+        requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+    } else {
+      // Reverse (manually step time backward)
+      video.pause();
+      let last = performance.now();
+      const tick = (now) => {
+        if (!isAutoPlaying) return;
+        const dt = Math.min(0.050, (now - last) / 1000); // cap dt for stability
+        last = now;
+        const step = REVERSE_SPEED_X * dt; // seconds per frame
+        const nextT = Math.max(targetTime, (video.currentTime || 0) - step);
+        video.currentTime = nextT;
+        const desiredY = nextT * PLAYBACK_CONST;
+        if (Math.abs(desiredY - window.scrollY) > 1) window.scrollTo(0, clamp(desiredY, 0, maxScroll));
+
+        if (nextT <= targetTime + 0.005) {
+          isAutoPlaying = false;
+          // If we hit the start boundary, flip baseline back to forward for next tap
+          if (targetTime <= 0.01) direction = 1;
+          return;
+        }
+        requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+    }
+  }
+
+  function cancelSegmentAutoplay() {
+    if (!isAutoPlaying) return;
+    isAutoPlaying = false;
+    video.pause();
+  }
+
+  // Helpers to find next/prev anchors
+  function currentSegmentIndex(t) {
+    // Return 0..(anchors.length-2) for segment index, or -1 if unknown
+    for (let i = 0; i < anchors.length - 1; i++) {
+      if (t >= anchors[i] - 1e-4 && t < anchors[i+1] - 1e-4) return i;
+    }
+    if (Math.abs(t - anchors[anchors.length - 1]) < 1e-3) return anchors.length - 2;
+    return -1;
+  }
+  function nextAnchorAbove(t) {
+    for (let i = 0; i < anchors.length; i++) {
+      if (anchors[i] > t + 1e-3) return anchors[i];
+    }
+    return anchors[anchors.length - 1]; // end
+  }
+  function prevAnchorBelow(t) {
+    for (let i = anchors.length - 1; i >= 0; i--) {
+      if (anchors[i] < t - 1e-3) return anchors[i];
+    }
+    return anchors[0]; // start
+  }
+
+  // ==========================
+  // SECTION 6: Misc helpers
+  // ==========================
+  function clamp(v, a, b) { return Math.min(Math.max(v, a), b); }
+
+  // Cancel autoplay on any key press (optional)
+  window.addEventListener('keydown', () => cancelSegmentAutoplay());
+
+  // Keep scroll bounds in sync if the viewport size changes
+  window.addEventListener('resize', () => {
+    if (!duration) return;
+    maxScroll = Math.max(0, Math.floor(duration * PLAYBACK_CONST));
+    spacer.style.height = (maxScroll + window.innerHeight) + 'px';
+  });
   </script>
 </body>
 </html>
